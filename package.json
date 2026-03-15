@@ -1,0 +1,17 @@
+{
+  "name": "kayzen-whatsapp-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@adiwajshing/baileys": "^5.0.0",
+    "@hapi/boom": "^10.0.0",
+    "mongodb": "^5.10.0",
+    "sharp": "^0.32.0",
+    "sqlite3": "^5.1.6",
+    "typr": "^0.2.1"
+  }
+}
