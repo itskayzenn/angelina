@@ -1,292 +1,456 @@
-import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, makeInMemoryStore, useMultiFileAuthState } from "@adiwajshing/baileys";
-import { config } from "./config.js";
-import { readdir } from "fs/promises";
-import { join } from "path";
-import { pathToFileURL } from "url";
-import { addXp, getUser, initDb, loadDb, saveDb } from "./lib/db.js";
+// external lib import
+import makeWASocket, {
+    makeCacheableSignalKeyStore,
+    useMultiFileAuthState,
+    DisconnectReason,
+    jidNormalizedUser,
+    fetchLatestWaWebVersion,
+    delay,
+    isJidGroup,
+    areJidsSameUser,
+    proto,
+} from "baileys";
+import P from 'pino'
+import NodeCache from '@cacheable/node-cache';
+import qrTerminal from 'qrcode-terminal'
 
-const store = makeInMemoryStore({});
-const commands = new Map();
-const pairingCodes = new Map();
-let db = null;
+// node js import
+import readline from 'node:readline'
+import fs from 'node:fs'
+import path from 'node:path'
 
-function normalizeJid(jid) {
-  return (jid || "").split("@")[0];
-}
+// local import
+import * as wawa from '#helper'
+import { allPath, msToReadableTime, sendText, safeRunAsync } from './system/helper.js'
+import patchMessageBeforeSending from "./system/patch-message-before-send.js";
+import UserManager from './system/manager-user.js'
+import PrefixManager from './system/manager-prefix.js'
+import PluginManager from './system/manager-plugin.js'
 
-function isOwner(jid) {
-  const norm = normalizeJid(jid);
-  const owners = (db?.owners ?? config.owners) || [];
-  return owners.some((o) => normalizeJid(o) === norm || o === jid);
-}
+// handler import
+import messageUpsertHandler from "./system/handler/message-upsert.js";
+import presenceUpdate from "./system/handler/presence-update.js";
 
-function isPremium(jid) {
-  const norm = normalizeJid(jid);
-  const premium = (db?.premium ?? config.premiumUsers) || [];
-  return premium.some((p) => normalizeJid(p) === norm || p === jid);
-}
+// object create
+const msgRetryCounterCache = new NodeCache();
+const userManager = new UserManager();
+const prefixManager = new PrefixManager()
+const pluginManager = new PluginManager()
 
-function getChatType(jid) {
-  if (!jid) return "private";
-  if (jid.endsWith("@g.us")) return "group";
-  return "private";
-}
+// object create store
+const groupMetadata = new Map()
+const contacts = new Map()
 
-function parseCommand(text) {
-  const parts = text.trim().split(/\s+/);
-  const raw = parts[0] || "";
-  const prefix = raw.slice(0, 1);
+let sock // = makeWASocket({})
 
-  if (!config.prefixes.includes(prefix)) return null;
+const bot = {
+    pn: null,
+    lid: null,
+    pushname: null,
+    log: true
+};
 
-  const name = raw.slice(1).toLowerCase();
-  const args = parts.slice(1);
-  return { name, args, prefix };
-}
+let gotCode = false;
 
-async function downloadMedia(url) {
-  try {
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    const buffer = Buffer.from(await res.arrayBuffer());
-    const mime = res.headers.get("content-type") ?? "application/octet-stream";
-    return { buffer, mime };
-  } catch {
-    return null;
-  }
-}
 
-async function loadCommands(dir = join(process.cwd(), "commands")) {
-  const entries = await readdir(dir, { withFileTypes: true });
 
-  for (const entry of entries) {
-    const fullPath = join(dir, entry.name);
-
-    if (entry.isDirectory()) {
-      await loadCommands(fullPath);
-      continue;
-    }
-
-    if (!entry.name.endsWith(".js")) continue;
-
-    try {
-      const mod = await import(pathToFileURL(fullPath).href);
-      const cmd = mod.default;
-      if (!cmd || !cmd.name) continue;
-
-      // Assign category based on folder name (if any)
-      const category = dir === join(process.cwd(), "commands") ? "general" : dir.split(/[/\\]/).pop();
-      cmd.category = cmd.category || category;
-
-      commands.set(cmd.name, cmd);
-      if (Array.isArray(cmd.aliases)) {
-        for (const alias of cmd.aliases) {
-          commands.set(alias, cmd);
-        }
-      }
-    } catch (err) {
-      console.error("Failed to load command", fullPath, err);
-    }
-  }
-}
-
-async function executeCommand(sock, sender, command, chatType, msg) {
-  if (db?.banned?.includes(normalizeJid(sender))) {
-    return; // ignore banned users entirely
-  }
-
-  const cmd = commands.get(command.name);
-  if (!cmd) {
-    return sock.sendMessage(sender, { text: config.responses.unknown });
-  }
-
-  const isOwnerUser = isOwner(sender);
-  if (cmd.options.ownerOnly && !isOwnerUser) {
-    return sock.sendMessage(sender, { text: config.responses.ownerOnly });
-  }
-
-  if (cmd.options.premiumOnly && !isPremium(sender) && !isOwnerUser) {
-    return sock.sendMessage(sender, { text: config.responses.premiumOnly });
-  }
-
-  if (cmd.options.chat === "private" && chatType !== "private") {
-    return sock.sendMessage(sender, { text: config.responses.privateOnly });
-  }
-
-  if (cmd.options.chat === "group" && chatType !== "group") {
-    return sock.sendMessage(sender, { text: config.responses.groupOnly });
-  }
-
-  const quoted = msg?.message?.extendedTextMessage?.contextInfo?.quotedMessage ?? null;
-
-  const send = async (message) => {
-    return sock.sendMessage(sender, message);
-  };
-
-  try {
-    await cmd.execute({
-      sock,
-      sender,
-      chatId: sender,
-      args: command.args,
-      chatType,
-      send,
-      config,
-      commands,
-      db,
-      saveDb,
-      pairingCodes,
-      generatePairingCode: (length) => {
-        let code = "";
-        while (code.length < length) {
-          code += Math.floor(Math.random() * 10).toString();
-        }
-        return code.slice(0, length);
-      },
-      downloadMedia,
-      downloadQuotedMedia: async () => {
-        if (!quoted) return null;
+//nitiip
+const consoleStream = {
+    write: (msg) => {
         try {
-          const buffer = await sock.downloadMediaMessage(quoted, "buffer");
-          const mime = quoted.imageMessage ? "image/jpeg" : quoted.videoMessage ? "video/mp4" : "application/octet-stream";
-          return { buffer, mime };
-        } catch {
-          return null;
+            const obj = JSON.parse(msg)
+            console.log('pino', obj)
+        } catch (e) {
+            console.error('non-json log:', msg)
         }
-      },
-      msg,
-      quoted,
+    }
+}
+const logger = P({ level: "error" })
+
+const getGroupMetadata = async (jid) => {
+
+    let data = groupMetadata.get(jid)
+    if (!data) {
+        try {
+            const fresh = await sock.groupMetadata(jid)
+            console.log(`↗️ fetch group metadata: ${fresh.subject}`)
+            groupMetadata.set(jid, fresh)
+            return fresh
+        } catch (error) {
+            console.error(`gagal fetch group metadata: ${jid}`, error)
+            return undefined
+        }
+    } else {
+        //console.log(`♻️ cache: ${data.subject}`)
+        return data
+    }
+
+    // return this.antri.run(jid, async () => {
+
+    // })
+}
+
+const store = {
+    groupMetadata,
+    contacts,
+    getGroupMetadata
+}
+
+
+// #GLOBAL VARIABLE NANTI DI HAPUS, INI UNTUK DEBUGINGS
+// global.prefix = prefixManager
+// global.user = userManager
+// global.bot = bot;
+// global.store = store;
+// global.pm = pluginManager
+// global.fs = fs
+// global.msgRetryCounterCache = msgRetryCounterCache
+// global.helper = wawa
+
+const { saveCreds, state } = await useMultiFileAuthState(allPath.baileysAuth);
+const { version } = await fetchLatestWaWebVersion()
+
+const init = async () => {
+    await pluginManager.loadPlugins()
+    pluginManager.buildMenu()
+}
+
+ const startSock = async function (opts = {}) {
+    console.log("✔️ fungsi startSock di panggil");
+    sock = makeWASocket({
+        version,
+        auth: {
+            creds: state.creds,
+            /** caching makes the store faster to send/recv messages */
+            keys: makeCacheableSignalKeyStore(state.keys, logger),
+        },
+        msgRetryCounterCache,
+        cachedGroupMetadata: store.getGroupMetadata,
+        logger,
+        patchMessageBeforeSending,
+        syncFullHistory: false,
+        shouldSyncHistoryMessage: msg => {
+            //console.log("should sycn history message", msg)
+            return false
+        },
     });
-  } catch (err) {
-    console.error("Command failed", command.name, err);
-    await send({ text: `Terjadi kesalahan: ${err.message}` });
-  }
-}
 
-async function startReminderLoop(sock) {
-  setInterval(async () => {
-    if (!db?.reminders?.length) return;
+    sock.ev.process(async (ev) => {
+        // if (ev['presence.update'] || ev['message-receipt.update'] || ev['creds.update'] || ev['connection.update']) {
+        //     // console.log(ev)
 
-    const now = Date.now();
-    const due = db.reminders.filter((r) => r.when <= now);
+        // } else {
+        //     if (bot.log) console.log(ev)
+        // }
 
-    for (const reminder of due) {
-      await sock.sendMessage(reminder.chatId, { text: `⏰ Reminder: ${reminder.text}` });
-      db.reminders = db.reminders.filter((r) => r.id !== reminder.id);
-    }
+        // console.log(ev)
 
-    await saveDb(db);
-  }, 30_000); // cek setiap 30 detik
-}
+        // handle koneksi
+        if (ev["connection.update"]) {
+            const update = ev["connection.update"];
+            const { connection, lastDisconnect, qr, isOnline } = update;
 
-async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState("./auth_info");
+            if (connection == "close") {
+                console.log("❌ koneksi tertutup");
 
-  await initDb();
-  db = await loadDb();
-  await loadCommands();
+                // logic logout
+                const logoutByUser = lastDisconnect?.error?.output?.statusCode == DisconnectReason.loggedOut;
+                if (logoutByUser) {
+                    if (fs.existsSync(allPath.baileysAuth)) {
+                        fs.rmSync(allPath.baileysAuth, {
+                            recursive: true,
+                            force: true,
+                        });
+                        console.log("logout by user or uncompleted pairing. auth folder deleted. program stopped (please wait)");
 
-  const { version, isLatest } = await fetchLatestBaileysVersion();
-  console.log(`Using WA version ${version.join(".")} (isLatest: ${isLatest})`);
+                        // restart to launcher
+                        process.exitCode = 69
+                        process.exit()
+                    }
 
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: true,
-    logger: (level, ...args) => {
-      if (level === "error") console.error(...args);
-    },
-  });
+                }
 
-  store.bind(sock.ev);
-  await startReminderLoop(sock);
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect } = update;
-    if (connection === "close") {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log("connection closed", lastDisconnect?.error, "- reconnecting:", shouldReconnect);
-      if (shouldReconnect) startBot();
-    } else if (connection === "open") {
-      console.log("✅ Connected to WhatsApp multi-device (MD)");
-    }
-  });
-
-  sock.ev.on("group-participants.update", async (update) => {
-    const groupId = update.id;
-    if (!db?.welcome) return;
-
-    const welcomeText = db.welcome[groupId];
-    if (!welcomeText) return;
-
-    for (const participant of update.participants) {
-      if (update.action === "add") {
-        await sock.sendMessage(groupId, { text: welcomeText.replace(/\{user\}/g, participant) });
-      }
-    }
-  });
-
-  sock.ev.on("messages.upsert", async (m) => {
-    const msg = m.messages[0];
-    if (!msg || msg.key.fromMe) return;
-
-    const messageType = Object.keys(msg.message || {})[0];
-    const sender = msg.key.remoteJid;
-
-    console.log(`
-📩 Incoming message from: ${sender}
-   type: ${messageType}
-   id: ${msg.key.id}
-`);
-
-    if (messageType === "conversation" || messageType === "extendedTextMessage") {
-      const text = msg.message.conversation || msg.message.extendedTextMessage.text;
-
-      if (typeof text === "string") {
-        const trimmed = text.trim();
-        const cmd = parseCommand(trimmed);
-        const chatType = getChatType(sender);
-
-        // Auto-responder
-        if (!cmd && Array.isArray(config.autoresponders)) {
-          const lower = trimmed.toLowerCase();
-          for (const item of config.autoresponders) {
-            if (lower.includes(item.match.toLowerCase())) {
-              await sock.sendMessage(sender, { text: item.response });
-              break;
+                // logic handling connection closed
+                else {
+                    sock.ev.removeAllListeners()
+                    sock.ws.close()
+                    sock = null
+                    await delay(5000)
+                    startSock()
+                }
             }
-          }
+
+            else if (connection == "open") {
+                console.log("✅ terhubung ke whatsapp");
+
+                // read last restart messafe (if any)
+                const lastRestartMessage = path.join(allPath.tempFolder, 'message-restart.bin')
+                const result = await safeRunAsync(fs.promises.readFile, lastRestartMessage)
+                if (result.ok) {
+                    console.log('found last restart message.. sending.. iam reincarnation')
+                    const wm = proto.WebMessageInfo.decode(result.data)
+                    await sock.sendMessage(wm.key.remoteJid, { text: `hey i born again! with pid: ${process.pid}` }, { quoted: wm })
+                    await fs.promises.rm(lastRestartMessage)
+                }
+            }
+
+            else if (connection == "connecting") {
+                console.log("🔃 menghubungkan ke whatsapp");
+            }
+
+            else if (qr) {
+                // qr print
+                if (opts.qr) {
+                    qrTerminal.generate(qr, { small: true })
+                }
+
+                // logic pairing code
+                if (!gotCode && opts.pn) {
+                    console.log(`please wait, sending login code to ${allPath.botNumber}`);
+                    const code = await sock.requestPairingCode(opts.pn, 'SEXYWOLF');
+                    console.log(`code ${code.match(/.{4}/g).join("-")}`);
+                    gotCode = true;
+                }
+            }
+
+            else if (isOnline) {
+                console.log("🟢 online")
+
+
+            }
         }
 
-        // XP / leveling
-        if (config.leveling?.enabled) {
-          const gained = cmd ? config.leveling.xpPerCommand : config.leveling.xpPerMessage;
-          const levelUp = addXp(db, sender, gained);
-          if (levelUp) {
-            const user = getUser(db, sender);
-            const msgText = config.leveling.levelUpMessage
-              .replace("{user}", sender)
-              .replace("{level}", String(user.level));
-            await sock.sendMessage(sender, { text: msgText });
-            await saveDb(db);
-          }
+        // handle kredensial
+        if (ev["creds.update"]) {
+            const bem = ev["creds.update"];
+
+            if (bem.me?.id && bem.me?.lid) {
+                bot.pushname = bem.me?.name || 'sexy bot';
+                bot.pn = jidNormalizedUser(bem.me.id);
+                bot.lid = jidNormalizedUser(bem.me.lid);
+
+                const obj = {
+                    notify: bot.pushname,
+                    verifiedName: undefined,
+                };
+
+                contacts.set(bot.pn, obj)
+                contacts.set(bot.lid, obj)
+
+            }
+            await saveCreds();
         }
 
-        if (cmd) {
-          await executeCommand(sock, sender, cmd, chatType, msg);
-          return;
+        // [push name]
+        if (ev['contacts.update']) {
+            const bem = ev['contacts.update']
+            for (let i = 0; i < bem.length; i++) {
+                const partialUpdate = bem[i]
+                const { id, ...rest } = partialUpdate
+                contacts.set(id, rest)
+            }
         }
 
-        await sock.sendMessage(sender, { text: `Anda mengirim: ${trimmed}` });
-      }
-    }
-  });
+        // [groupMetadata] 
+        if (ev['groups.update']) {
+            const bem = ev['groups.update']
+            for (let i = 0; i < bem.length; i++) {
+                const partialUpdate = bem[i] //bem (baileys event map), karena bentukan array jadi musti di ambil 1 1
+                const jid = partialUpdate.id // simpen dulu current jid nyah
+                const current = await getGroupMetadata(jid) //ambil dulu grup matadata current jid
+                if (current) Object.assign(current, partialUpdate)
+
+            }
+        }
+
+        // [groupMetadata] [chat]
+        if (ev['groups.upsert']) {
+            const bem = ev['groups.upsert']
+            for (let i = 0; i < bem.length; i++) {
+                const newGroupMetaData = bem[i] //bem (baileys event map), karena bentukan array jadi musti di ambil 1 1
+                const jid = newGroupMetaData.id // simpen dulu current jid nyah
+                groupMetadata.set(jid, newGroupMetaData) //simpen data baru ke store
+            }
+        }
+
+        // [groupMetadata]
+        if (ev['group-participants.update']) {
+            const bem = ev['group-participants.update']
+            const action = bem.action
+            const jid = bem.id
+            const selectedParticipants = bem.participants
+
+            const promoteDemote = async (participantsArray, nullOrAdmin) => {
+                const current = await getGroupMetadata(jid)
+                if (!current) return
+                for (let i = 0; i < participantsArray.length; i++) {
+                    const newParticipant = participantsArray[i]
+                    const find = current.participants.find(cp => cp.id == newParticipant.id)
+                    const newParticipantData = {
+                        //id: newParticipant.id,
+                        admin: nullOrAdmin
+                    }
+
+                    if (find) {
+                        Object.assign(find, newParticipantData)
+                    } else {
+                        current.participants.push(newParticipantData)
+                    }
+                }
+            }
+
+            const remove = async (participantsArray, gMetadata, gMetadataJid) => {
+                const isBotKicked = participantsArray.some(p => areJidsSameUser(p.id, bot.lid))
+                if (isBotKicked) {
+                    console.log('bot kicked from group')
+                    gMetadata.delete(gMetadataJid)
+                } else {
+                    const current = await getGroupMetadata(gMetadataJid)
+                    if (!current) return
+                    participantsArray.forEach(kickedParticipant => {
+                        const idx = current.participants.findIndex(p => p.id == kickedParticipant.id)
+                        if (idx != -1) {
+                            current.participants.splice(idx, 1)
+                        }
+                    })
+                    current.size = current.participants.length
+                }
+            }
+
+            const add = async (participantsArray) => {
+                const current = await getGroupMetadata(jid)
+                if (!current) return
+
+                for (let i = 0; i < participantsArray.length; i++) {
+                    const newParticipant = participantsArray[i]
+                    const find = current.participants.find(cp => cp.id == newParticipant.id)
+                    if (!find) {
+                        current.participants.push({
+                            id: newParticipant.id,
+                            lid: undefined,
+                            phoneNumber: newParticipant.phoneNumber,
+                            admin: null
+                        })
+                    }
+                }
+                current.size = current.participants.length
+            }
+
+            switch (action) {
+                case 'add':
+                    await add(selectedParticipants)
+                    break
+                case 'promote':
+                    await promoteDemote(selectedParticipants, 'admin')
+                    break
+                case 'demote':
+                    await promoteDemote(selectedParticipants, null)
+                    break
+                case 'remove':
+                    await remove(selectedParticipants, groupMetadata, jid)
+                    break
+                case 'modify':
+                    console.log('modify', bem)
+                    break
+            }
+        }
+
+        // [groupMetadata] [chat]
+        if (ev['chats.update']) {
+            const bem = ev['chats.update']
+            for (let i = 0; i < bem.length; i++) {
+                const partialUpdate = bem[i] //bem (baileys event map), karena bentukan array jadi musti di ambil 1 1
+                const jid = partialUpdate.id // simpen dulu current jid nyah
+
+                // update ephemeral ke store grup
+                if (isJidGroup(jid)) {
+                    if (!partialUpdate.hasOwnProperty('ephemeralExpiration')) continue
+                    const value = partialUpdate.ephemeralExpiration || undefined
+                    const ephemUpdate = { ephemeralDuration: value }
+                    const current = await getGroupMetadata(jid) //ambil dulu grup matadata current jid
+
+                    Object.assign(current, ephemUpdate)
+                    console.log('group ephemeral update', ephemUpdate)
+                }
+            }
+        }
+
+        if (ev['messages.upsert']) {
+            await messageUpsertHandler(sock, ev['messages.upsert'])
+        }
+
+
+        if (ev['presence.update']) {
+            await presenceUpdate(sock, ev['presence.update'])
+        }
+    });
+
+    // if (global.sock) delete global.sock
+    // global.sock = sock
 }
 
-startBot().catch((err) => {
-  console.error("Fatal error", err);
-  process.exit(1);
-});
+
+// IPC
+process.on('message', async (message) => {
+    if (message.type === 'uptime') {
+        const print = msToReadableTime(message.data.uptime * 1000)
+        const jid = message.data.jid
+        await sendText(sock, jid, print)
+    }
+})
+
+export { pluginManager, prefixManager, userManager, store, bot }
+
+
+
+
+
+
+// handling init
+const credsPath = path.join(import.meta.dirname, 'auth/creds.json')
+const credsExist = await safeRunAsync(fs.promises.access, credsPath)
+if (!credsExist.ok) {
+    console.log('no creds found. starting new login')
+    // interface
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+    });
+
+    const ask = (question) => new Promise((resolve) => rl.question(question, resolve));
+
+    const loginMethod = ['1', '2', '3']
+    let userLoginMethod
+    let valid
+    let botPhoneNumber
+    do {
+        const question = `select your login method:\n1. pairing code\n2. qr scan\n3. nevermind\ntype number only > `
+        userLoginMethod = await ask(question)
+        valid = loginMethod.includes(userLoginMethod)
+        if (!valid) console.log(`${userLoginMethod} is invalid try again\n`)
+    } while (!valid)
+
+    if (userLoginMethod === loginMethod[0]) {
+        const question = `enter bot's phone number (6281xxx) or type exit to exit :\n type > `
+        botPhoneNumber = await ask(question)
+        if (botPhoneNumber === 'exit') {
+            console.log('bye!')
+            process.exit()
+        }
+        init()
+        startSock({ pn: botPhoneNumber })
+    } else if (userLoginMethod === loginMethod[1]) {
+        init()
+        startSock({ qr: true })
+    } else if (userLoginMethod === loginMethod[2]) {
+        console.log('bai bai')
+    }
+
+    rl.close()
+    console.log('readline closed')
+
+} else {
+    console.log('start bot as usual')
+    init()
+    startSock()
+}
